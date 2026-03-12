@@ -1,10 +1,11 @@
 from pathlib import Path
-
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 import traceback
+import json
 from fastapi import Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
 
 from app.adapters.weaviate.client import get_weaviate_client, get_url
 from app.adapters.storage.local_storage import LocalFileStorage
@@ -17,8 +18,33 @@ load_dotenv()
 
 app = FastAPI(title="LeaseCopilot API", version="0.1.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  #dev only
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 UPLOAD_DIR = Path(__file__).resolve().parents[2] / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENT_PATHS_FILE = UPLOAD_DIR / "document_paths.json"
+
+
+def _load_document_paths():
+    if not DOCUMENT_PATHS_FILE.exists():
+        return {}
+    try:
+        return json.loads(DOCUMENT_PATHS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_document_path(document_id: str, storage_uri: str):
+    paths = _load_document_paths()
+    paths[document_id] = storage_uri
+    DOCUMENT_PATHS_FILE.write_text(json.dumps(paths, indent=2))
+
 
 storage = LocalFileStorage(base_dir=UPLOAD_DIR)
 ingestion = IngestionService(storage=storage)
@@ -46,6 +72,12 @@ def ask(req: AskRequest):
             alpha=req.alpha,
             top_n=req.top_n,
         )
+        # When a specific document was requested but no chunks were found, treat as no document data
+        if req.document_id and len(res.sources) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No document data found. Please upload the file again.",
+            )
         return {"answer": res.answer, "sources": [s.__dict__ for s in res.sources]}
     finally:
         qa.close()
@@ -66,7 +98,7 @@ def health_weaviate():
 @app.post("/documents")
 async def upload_document(
     file: UploadFile = File(...),
-    property_id: str = Form(...),
+    property_id: str = Form(""),
     owner_id: str = Form("demo_owner"),
 ):
     if not file.filename:
@@ -84,11 +116,30 @@ async def upload_document(
         file_bytes=data,
     )
 
+    _save_document_path(res.document_id, res.storage_uri)
+
     return {
         "document_id": res.document_id,
         "chunks_indexed": res.chunks_indexed,
         "storage_uri": res.storage_uri,
     }
+
+
+@app.get("/documents/{document_id}/file")
+def get_document_file(document_id: str):
+    paths = _load_document_paths()
+    path_str = paths.get(document_id)
+    if not path_str:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = Path(path_str)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    display_name = path.name.split("__", 1)[-1] if "__" in path.name else path.name
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
 
 
 @app.exception_handler(Exception)
